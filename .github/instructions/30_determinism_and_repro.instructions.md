@@ -1,12 +1,25 @@
-# Determinism and Reproducibility
+# Determinism & Reproducibility (Hard Requirement)
 
-Scribble generation must be reproducible.
+All variability MUST be deterministic.
 
-Rules:
-- Same mask → same scribble
-- No stochastic behavior during training
-- If randomness is used:
-  - Fix the seed
-  - Execute once during dataset preparation
+Allowed:
 
-Prefer rule-based decisions over random sampling.
+- `seed = CRC32(mask_bytes)`
+- `rng = np.random.default_rng(seed + k)` for stroke index k
+- Deterministic math (no global RNG dependence)
+
+Forbidden:
+
+- `np.random.*` without explicit generator
+- Python `random`
+- time-based seeds
+- reliance on global state
+- any augmentation that changes scribble per epoch
+
+Definition:
+
+- For the same `mask` input, `from_mask(mask)` MUST return bitwise identical output.
+
+Testing:
+
+- Add a unit test that calls generation twice on the same mask and asserts equality.

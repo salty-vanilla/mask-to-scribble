@@ -1,11 +1,19 @@
-# marimo Usage
+# marimo Usage (Tuning & Debug Only)
 
 marimo is used for:
-- Visual inspection of scribbles
-- Interactive tuning of parameters
 
-marimo must NOT:
-- Be required by the core package
-- Introduce runtime dependencies
+- interactive parameter tuning
+- visualization (mask, scribble, overlay)
+- debugging (sampled points, MST edges, routed paths)
 
-Use marimo only for experimentation and visualization.
+marimo must not:
+
+- be required for importing the package
+- change the core algorithm
+- introduce non-deterministic behavior in the library
+
+Recommended marimo features:
+
+- sliders for K, coverage_cap, jitter_strength, mix_center, N points
+- debug toggle to show points + MST edges + routed paths
+- export selected parameters as a config snippet

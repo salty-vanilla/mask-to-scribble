@@ -1,18 +1,24 @@
 # Project Scope
 
-This project provides a deterministic scribble generator
-from binary defect masks.
+Goal:
 
-Primary use case:
-- Positive-Unlabeled Anomaly Detection (PU-SAC, Dinomaly)
-- Datasets with masks only (e.g. MVTecAD)
-
-Key constraints:
-- Scribbles are generated ONCE per mask
-- No random regeneration during training
-- Mimics a single human annotation action
+- Generate **human-like scribble annotations** from **binary defect masks**.
+- Scribbles are used for **PU learning** (Positive = scribble pixels, Unlabeled = remaining pixels).
 
 Non-goals:
-- Full mask supervision
-- Online data augmentation
-- Interactive labeling tools
+
+- Approximating the full defect mask.
+- Creating stochastic augmentation during training.
+- Any method that reconstructs unlabeled defect regions as positive labels.
+
+Inputs / outputs:
+
+- Input mask: `uint8 (H, W)` where defect pixels are `>0` (typically 255).
+- Output scribble:
+  - `uint8` in `{0, 255}` by default
+  - `float32` in `[0, 1]` if soft labels are enabled
+
+Constraints:
+
+- Deterministic generation (bitwise identical for the same mask).
+- Coverage cap enforced to avoid scribble becoming a full mask.
