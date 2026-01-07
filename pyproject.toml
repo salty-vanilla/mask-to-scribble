@@ -9,8 +9,8 @@ description = "Generate human-like scribble annotations from defect masks"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "opencv-contrib-python-headless>=4.12.0.88",
-    "scikit-image>=0.26.0",
+  "opencv-contrib-python-headless>=4.12.0.88",
+  "scikit-image>=0.26.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -40,8 +40,4 @@ docstring-code-format = true
 "tests/**/*.py" = ["S101", "ANN201", "N802", "ARG"]
 
 [dependency-groups]
-dev = [
-    "marimo>=0.18.4",
-    "ruff>=0.14.10",
-    "ty>=0.0.9",
-]
+dev = ["marimo>=0.18.4", "ruff>=0.14.10", "ty>=0.0.9"]
