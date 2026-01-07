@@ -1,252 +1,283 @@
-"""Core scribble generation logic."""
+"""Deterministic multi-scribble generator from binary masks.
+
+Core idea (per scribble stroke k):
+1) Select N_k points inside mask with mixture of two priors:
+   - center-prior (near centroid)
+   - boundary-prior (near boundary)
+2) Build MST edges among points (deterministic).
+3) For each edge, route a path inside mask using Dijkstra with jittered cost.
+4) Combine K strokes with OR.
+5) Thicken strokes. Optional soft labels.
+
+Determinism:
+- base_seed = CRC32(mask bytes)
+- per-stroke rng: default_rng(base_seed + k)
+
+Dependencies:
+- numpy
+- opencv-python
+- scikit-image (route_through_array)
+"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import zlib
 from typing import TYPE_CHECKING
 
 import cv2
 import numpy as np
-from skimage.morphology import skeletonize
+
+from .geometry import build_mst_edges, compute_centroid_yx
+from .param_utils import pick_float, pick_int
+from .rendering import compute_stroke_radius, dilate_with_radius, generate_soft_labels
+from .routing import make_jitter_field, route_path_inside_mask
+from .sampling import (
+    choose_num_points,
+    compute_min_distance,
+    fallback_points,
+    sample_points_with_mixture,
+)
+from .types import FloatSpec, IntSpec, ScribbleConfig
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-@dataclass
-class ScribbleConfig:
-    """Configuration for scribble generation.
-
-    Attributes:
-        contour_ratio: Fraction of contour to use (0.2-0.4 recommended)
-        min_thickness: Minimum stroke thickness in pixels
-        thickness_scale: Scale factor for thickness based on defect area
-        use_soft_labels: Whether to generate soft labels with distance decay
-        soft_label_sigma: Sigma for Gaussian distance decay in soft labels
-
-    """
-
-    contour_ratio: float = 0.3
-    min_thickness: int = 2
-    thickness_scale: float = 0.01
-    use_soft_labels: bool = False
-    soft_label_sigma: float = 2.0
-
-
+# -----------------------------
+# Generator
+# -----------------------------
 class ScribbleGenerator:
-    """Generates deterministic human-like scribble annotations from binary masks.
-
-    The generator creates scribbles with:
-    - One skeleton stroke (main branch)
-    - One contour stroke (partial boundary segment)
-    - Optional connecting stroke between skeleton and contour
-
-    Scribbles are reproducible: same mask always produces same scribble.
-    """
+    """Generator for deterministic multi-stroke scribbles from binary masks."""
 
     def __init__(self, config: ScribbleConfig | None = None) -> None:
-        """Initialize scribble generator.
+        """Initialize generator with configuration.
 
         Args:
-            config: Configuration for scribble generation. Uses defaults if None.
+            config: Scribble generation configuration
 
         """
-        self.config = config or ScribbleConfig()
+        self.cfg = config or ScribbleConfig()
 
-    def from_mask(self, mask: NDArray[np.uint8]) -> NDArray[np.uint8 | np.float32]:
-        """Generate scribble annotation from binary mask.
+    def from_mask(self, mask: NDArray[np.uint8]) -> NDArray[np.uint8] | NDArray[np.float32]:
+        """Generate scribble from binary mask.
 
         Args:
-            mask: Binary mask (H, W) with defect region as 255, background as 0
+            mask: Binary mask (uint8, 0 or 255)
 
         Returns:
-            Scribble annotation with same shape as mask.
-            - If use_soft_labels=False: uint8 array with strokes as 255
-            - If use_soft_labels=True: float32 array with values in [0, 1]
+            Scribble image (uint8 if binary, float32 if soft labels)
+
+        """
+        self._validate_mask(mask)
+
+        if mask.max() == 0:
+            return np.zeros_like(mask, dtype=np.float32 if self.cfg.use_soft_labels else np.uint8)
+
+        m = (mask > 0).astype(np.uint8)  # 0/1
+        area = int(m.sum())
+        if area <= 0:
+            return np.zeros_like(mask, dtype=np.float32 if self.cfg.use_soft_labels else np.uint8)
+
+        base_seed = self._stable_seed(mask)
+
+        # precompute geometry that does NOT depend on per-stroke params
+        dt_inside = cv2.distanceTransform((m * 255).astype(np.uint8), cv2.DIST_L2, 3).astype(
+            np.float32,
+        )
+        centroid_yx = compute_centroid_yx(m)
+
+        final = np.zeros_like(mask, dtype=np.uint8)
+
+        # generate K scribbles
+        for k in range(int(max(1, self.cfg.num_scribbles))):
+            rng = np.random.default_rng(base_seed + k)
+
+            # per-stroke params
+            n_k = choose_num_points(area, rng=rng, k=k, config=self.cfg)
+            mix_center_k = float(np.clip(pick_float(self.cfg.mix_center, rng, k, 0.5), 0.0, 1.0))
+            center_sigma_scale_k = max(
+                0.01,
+                pick_float(self.cfg.center_sigma_scale, rng, k, 0.25),
+            )
+            boundary_sigma_k = max(0.5, pick_float(self.cfg.boundary_sigma, rng, k, 6.0))
+            min_dist_scale_k = max(0.0, pick_float(self.cfg.min_dist_scale, rng, k, 0.10))
+            jitter_strength_k = max(0.0, pick_float(self.cfg.jitter_strength, rng, k, 0.25))
+            jitter_ksize_k = int(pick_int(self.cfg.jitter_smooth_ksize, rng, k, 9))
+            center_bias_k = max(0.0, pick_float(self.cfg.center_bias, rng, k, 0.10))
+
+            jitter_field = make_jitter_field(m.shape, rng=rng, ksize=jitter_ksize_k)
+            min_dist = compute_min_distance(
+                area,
+                min_dist_scale=min_dist_scale_k,
+                min_dist_min=self.cfg.min_dist_min,
+                min_dist_max=self.cfg.min_dist_max,
+            )
+
+            # sample points
+            pts_xy = sample_points_with_mixture(
+                m=m,
+                dt_inside=dt_inside,
+                centroid_yx=centroid_yx,
+                area=area,
+                n=n_k,
+                rng=rng,
+                mix_center=mix_center_k,
+                center_sigma_scale=center_sigma_scale_k,
+                boundary_sigma=boundary_sigma_k,
+                min_dist=min_dist,
+                max_sampling_trials=self.cfg.max_sampling_trials,
+            )
+
+            if len(pts_xy) < 2:  # noqa: PLR2004
+                pts_xy = fallback_points(m, dt_inside, centroid_yx)
+
+            edges = build_mst_edges(pts_xy)
+
+            stroke = np.zeros_like(mask, dtype=np.uint8)
+            for i, j in edges:
+                a = pts_xy[i]
+                b = pts_xy[j]
+                path = route_path_inside_mask(
+                    m=m,
+                    dt_inside=dt_inside,
+                    a_xy=a,
+                    b_xy=b,
+                    jitter=jitter_field,
+                    jitter_strength=jitter_strength_k,
+                    center_bias=center_bias_k,
+                )
+                if path is not None and len(path) > 0:
+                    stroke[path[:, 0], path[:, 1]] = 255  # path is (y,x)
+
+            # keep within defect
+            stroke = cv2.bitwise_and(stroke, (m * 255).astype(np.uint8))
+
+            # merge
+            final = cv2.bitwise_or(final, stroke)
+
+            # coverage cap (optional per-stroke)
+            if self.cfg.coverage_check_each_stroke and self._exceeds_coverage(final, m):
+                break
+
+        # thickness
+        r = compute_stroke_radius(
+            area,
+            min_radius=self.cfg.min_radius,
+            radius_scale=self.cfg.radius_scale,
+            max_radius=self.cfg.max_radius,
+        )
+        final = dilate_with_radius(final, r)
+
+        # keep within defect
+        final = cv2.bitwise_and(final, (m * 255).astype(np.uint8))
+
+        # final coverage cap (safety)
+        if self._exceeds_coverage(final, m):
+            # If exceeded after dilation, lightly erode once to reduce coverage.
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            final = cv2.erode(final, kernel, iterations=1)
+
+        if self.cfg.use_soft_labels:
+            return generate_soft_labels(final, self.cfg.soft_label_sigma)
+
+        return final
+
+    def _stable_seed(self, mask: NDArray[np.uint8]) -> int:
+        """Generate deterministic seed from mask content.
+
+        Args:
+            mask: Binary mask
+
+        Returns:
+            CRC32 checksum as seed
+
+        """
+        data = memoryview(mask).tobytes()
+        return int(zlib.crc32(data) & 0xFFFFFFFF)
+
+    def _exceeds_coverage(self, scribble_255: NDArray[np.uint8], m01: NDArray[np.uint8]) -> bool:
+        """Check if scribble exceeds coverage cap.
+
+        Args:
+            scribble_255: Binary scribble (0/255)
+            m01: Binary mask (0/1)
+
+        Returns:
+            True if coverage exceeds cap
+
+        """
+        cap = float(self.cfg.coverage_cap)
+        if cap <= 0:
+            return False
+        mask_area = int(m01.sum())
+        if mask_area <= 0:
+            return False
+        scribble_area = int(np.sum((scribble_255 > 0) & (m01 > 0)))
+        cov = scribble_area / float(mask_area)
+        return cov > cap
+
+    def _validate_mask(self, mask: NDArray[np.uint8]) -> None:
+        """Validate mask format.
+
+        Args:
+            mask: Binary mask to validate
+
+        Raises:
+            TypeError: If mask is not uint8
+            ValueError: If mask is not 2D
 
         """
         if mask.dtype != np.uint8:
-            msg = f"Mask must be uint8, got {mask.dtype}"
+            msg = f"mask must be uint8, got {mask.dtype}"
             raise TypeError(msg)
-
-        if mask.max() == 0:
-            # Empty mask returns empty scribble
-            if self.config.use_soft_labels:
-                return np.zeros_like(mask, dtype=np.float32)
-            return np.zeros_like(mask, dtype=np.uint8)
-
-        # Extract skeleton stroke
-        skeleton_stroke = self._extract_skeleton_stroke(mask)
-
-        # Extract contour stroke
-        contour_stroke = self._extract_contour_stroke(mask)
-
-        # Combine strokes
-        scribble = cv2.bitwise_or(skeleton_stroke, contour_stroke)
-
-        # Calculate thickness based on defect area
-        thickness = self._calculate_thickness(mask)
-
-        # Apply thickness
-        if thickness > 1:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (thickness, thickness))
-            scribble = cv2.dilate(scribble, kernel, iterations=1)
-
-        # Apply soft labels if requested
-        if self.config.use_soft_labels:
-            return self._apply_soft_labels(scribble)
-
-        return scribble
-
-    def _extract_skeleton_stroke(self, mask: NDArray[np.uint8]) -> NDArray[np.uint8]:
-        """Extract main skeleton branch from mask.
-
-        Args:
-            mask: Binary mask
-
-        Returns:
-            Binary image with skeleton stroke
-
-        """
-        # Skeletonize the mask (convert to binary first)
-        binary_mask = mask > 0
-        skeleton = skeletonize(binary_mask)
-        skeleton_uint8 = (skeleton * 255).astype(np.uint8)
-
-        # Find connected components in skeleton
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            skeleton_uint8, connectivity=8,
-        )
-
-        if num_labels <= 1:
-            # No skeleton found
-            return np.zeros_like(mask)
-
-        # Find largest connected component (excluding background)
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        largest_label = np.argmax(areas) + 1
-
-        # Keep only the largest branch
-        skeleton_stroke = np.zeros_like(mask)
-        skeleton_stroke[labels == largest_label] = 255
-
-        return skeleton_stroke
-
-    def _extract_contour_stroke(self, mask: NDArray[np.uint8]) -> NDArray[np.uint8]:
-        """Extract partial contour segment from mask.
-
-        Uses only a fraction (contour_ratio) of the boundary to avoid
-        full boundary tracing.
-
-        Args:
-            mask: Binary mask
-
-        Returns:
-            Binary image with contour stroke
-
-        """
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-        if not contours:
-            return np.zeros_like(mask)
-
-        # Use the largest contour
-        contour = max(contours, key=cv2.contourArea)
-
-        # Calculate segment length
-        contour_length = len(contour)
-        segment_length = int(contour_length * self.config.contour_ratio)
-
-        if segment_length < 2:
-            return np.zeros_like(mask)
-
-        # Take a segment starting from a deterministic position
-        # Use the topmost point for reproducibility
-        contour_points = contour.reshape(-1, 2)
-        start_idx = np.argmin(contour_points[:, 1])  # Topmost point (min y)
-
-        # Extract segment
-        indices = np.arange(start_idx, start_idx + segment_length) % contour_length
-        segment = contour[indices]
-
-        # Draw segment on blank image
-        contour_stroke = np.zeros_like(mask)
-        cv2.drawContours(contour_stroke, [segment], -1, 255, 1)
-
-        return contour_stroke
-
-    def _calculate_thickness(self, mask: NDArray[np.uint8]) -> int:
-        """Calculate stroke thickness based on defect area.
-
-        Args:
-            mask: Binary mask
-
-        Returns:
-            Thickness in pixels
-
-        """
-        defect_area = np.sum(mask > 0)
-        thickness = int(np.sqrt(defect_area) * self.config.thickness_scale)
-        return max(thickness, self.config.min_thickness)
-
-    def _apply_soft_labels(self, scribble: NDArray[np.uint8]) -> NDArray[np.float32]:
-        """Apply soft labels with distance-based decay.
-
-        Args:
-            scribble: Binary scribble (0 or 255)
-
-        Returns:
-            Soft labels in range [0, 1] with Gaussian decay from strokes
-
-        """
-        # Compute distance transform from scribble strokes
-        distance = cv2.distanceTransform(255 - scribble, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
-
-        # Apply Gaussian decay
-        soft_labels = np.exp(-(distance**2) / (2 * self.config.soft_label_sigma**2))
-
-        return soft_labels.astype(np.float32)
+        if mask.ndim != 2:  # noqa: PLR2004
+            msg = f"mask must be 2D (H,W), got {mask.shape}"
+            raise ValueError(msg)
 
 
-def generate_scribble(
+# -----------------------------
+# Functional API
+# -----------------------------
+def generate_scribble(  # noqa: PLR0913
     mask: NDArray[np.uint8],
-    contour_ratio: float = 0.3,
-    min_thickness: int = 2,
-    thickness_scale: float = 0.01,
+    *,
+    num_scribbles: int = 3,
+    coverage_cap: float = 0.15,
+    coverage_check_each_stroke: bool = True,
+    fixed_num_points: int | None = None,
+    min_points: int = 3,
+    max_points: int = 7,
+    mix_center: FloatSpec = 0.5,
+    center_sigma_scale: FloatSpec = 0.25,
+    boundary_sigma: FloatSpec = 6.0,
+    min_dist_scale: FloatSpec = 0.10,
+    jitter_strength: FloatSpec = 0.25,
+    jitter_smooth_ksize: IntSpec = 9,
+    center_bias: FloatSpec = 0.10,
+    min_radius: int = 2,
+    radius_scale: float = 0.012,
+    max_radius: int = 20,
     use_soft_labels: bool = False,
     soft_label_sigma: float = 2.0,
-) -> NDArray[np.uint8 | np.float32]:
-    """Generate scribble annotation from binary mask (functional API).
-
-    Args:
-        mask: Binary mask (H, W) with defect region as 255, background as 0
-        contour_ratio: Fraction of contour to use (0.2-0.4 recommended)
-        min_thickness: Minimum stroke thickness in pixels
-        thickness_scale: Scale factor for thickness based on defect area
-        use_soft_labels: Whether to generate soft labels with distance decay
-        soft_label_sigma: Sigma for Gaussian distance decay in soft labels
-
-    Returns:
-        Scribble annotation with same shape as mask.
-        - If use_soft_labels=False: uint8 array with strokes as 255
-        - If use_soft_labels=True: float32 array with values in [0, 1]
-
-    Example:
-        >>> import numpy as np
-        >>> mask = np.zeros((100, 100), dtype=np.uint8)
-        >>> mask[30:70, 30:70] = 255
-        >>> scribble = generate_scribble(mask)
-        >>> scribble.shape
-        (100, 100)
-
-    """
-    config = ScribbleConfig(
-        contour_ratio=contour_ratio,
-        min_thickness=min_thickness,
-        thickness_scale=thickness_scale,
+) -> NDArray[np.uint8] | NDArray[np.float32]:
+    cfg = ScribbleConfig(
+        num_scribbles=num_scribbles,
+        coverage_cap=coverage_cap,
+        coverage_check_each_stroke=coverage_check_each_stroke,
+        fixed_num_points=fixed_num_points,
+        min_points=min_points,
+        max_points=max_points,
+        mix_center=mix_center,
+        center_sigma_scale=center_sigma_scale,
+        boundary_sigma=boundary_sigma,
+        min_dist_scale=min_dist_scale,
+        jitter_strength=jitter_strength,
+        jitter_smooth_ksize=jitter_smooth_ksize,
+        center_bias=center_bias,
+        min_radius=min_radius,
+        radius_scale=radius_scale,
+        max_radius=max_radius,
         use_soft_labels=use_soft_labels,
         soft_label_sigma=soft_label_sigma,
     )
-    generator = ScribbleGenerator(config)
-    return generator.from_mask(mask)
+    return ScribbleGenerator(cfg).from_mask(mask)
