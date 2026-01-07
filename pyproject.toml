@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Generate human-like scribble annotations from defect masks"
 readme = "README.md"
 requires-python = ">=3.11"
+authors = [{ name = "Shunsuke Nakatsuka", email = "jacketgardensio@gmail.com" }]
 dependencies = [
   "opencv-contrib-python-headless>=4.12.0.88",
   "pyzmq>=27.1.0",
@@ -42,9 +43,9 @@ docstring-code-format = true
 
 [dependency-groups]
 dev = [
-    "marimo>=0.18.4",
-    "matplotlib>=3.10.8",
-    "plotly>=6.5.0",
-    "ruff>=0.14.10",
-    "ty>=0.0.9",
+  "marimo>=0.18.4",
+  "matplotlib>=3.10.8",
+  "plotly>=6.5.0",
+  "ruff>=0.14.10",
+  "ty>=0.0.9",
 ]
